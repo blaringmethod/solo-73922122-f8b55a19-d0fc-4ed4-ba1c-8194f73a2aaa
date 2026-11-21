@@ -56,6 +56,18 @@
               margin-bottom:10px; background:#fafbfc; }
   .newblock h3 { font-size:13px; margin:0 0 6px; display:flex; justify-content:space-between; }
   code { background:#f3f4f6; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .b-anomaly { background:#fee2e2; color:var(--red); }
+  .b-ok { background:#dcfce7; color:var(--green); }
+  .inspect-meta { font-size:12px; color:var(--muted); margin:6px 0 10px; }
+  .inspect-summary { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+  .kpi { border:1px solid var(--line); border-radius:8px; padding:8px 12px;
+         background:#fafbfc; font-size:12px; min-width:120px; }
+  .kpi b { display:block; font-size:17px; margin-top:2px; }
+  .kpi.bad b { color:var(--red); }
+  .code { display:inline-block; padding:1px 6px; border-radius:4px;
+          background:#fee2e2; color:var(--red); font-size:11px; margin:1px 2px 1px 0; }
+  #insp-table td { vertical-align:top; }
+  .spin { opacity:.6; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -66,7 +78,6 @@
   <button class="ghost" onclick="refreshAll()">刷新</button>
   <button class="primary" onclick="downloadCsv()">下载对账 CSV（仅有效单）</button>
 </header>
-
 <main>
   <!-- 原单录入 -->
   <section class="card">
@@ -94,9 +105,25 @@
     <p class="muted" style="margin-top:10px">同包号同内容重传沿用原结果；异内容拒收。校验未通过会在下方“改单包”列表给出原因。</p>
   </section>
 
+  <!-- 改单台账质量巡检 -->
+  <section class="card full">
+    <h2>③ 改单台账质量巡检</h2>
+    <div class="toolbar">
+      <button class="primary" id="inspect-btn" onclick="runInspection()">开始巡检</button>
+      <span class="muted">固定同一 SQLite 读快照，只检查已生效改单包；巡检期间仍可提交改单，报告不会混入新写入。</span>
+    </div>
+    <div id="inspect-meta" class="inspect-meta">尚未巡检</div>
+    <div id="inspect-summary" class="inspect-summary"></div>
+    <table id="insp-table">
+      <thead><tr><th>包号</th><th>货批</th><th>改前重量 kg</th><th>改后重量 kg</th>
+        <th>涉及旧单 → 新单</th><th>结果</th><th>异常原因</th></tr></thead>
+      <tbody id="insp-tbody"></tbody>
+    </table>
+  </section>
+
   <!-- 运单列表 -->
   <section class="card full">
-    <h2>③ 运单台账</h2>
+    <h2>④ 运单台账</h2>
     <div class="toolbar">
       <select id="wb-filter" onchange="renderWaybills()">
         <option value="">全部</option>
@@ -114,7 +141,7 @@
 
   <!-- 改单包列表 -->
   <section class="card full">
-    <h2>④ 改单包处理结果（挂起 / 拒收原因）</h2>
+    <h2>⑤ 改单包处理结果（挂起 / 拒收原因）</h2>
     <div class="toolbar">
       <select id="pkg-filter" onchange="renderPackages()">
         <option value="">全部</option>
@@ -280,6 +307,67 @@ function renderPackages() {
     '<tr><td colspan="6" class="muted">暂无改单包</td></tr>';
 }
 function downloadCsv() { window.location = "/api/reconciliation.csv"; }
+
+// ---------- 质量巡检 ----------
+const codeLabels = {
+  weight_mismatch: "重量不守恒",
+  duplicate_attribution: "重复归属",
+  missing_reference: "引用缺失",
+  declared_mismatch: "申报与实际不一致",
+  invalid_payload: "包内容不可解析",
+};
+async function runInspection() {
+  const btn = $("inspect-btn");
+  btn.classList.add("spin"); btn.textContent = "巡检中…";
+  $("inspect-meta").textContent = "正在固定读快照…";
+  try {
+    const r = await fetch("/api/inspections/quality");
+    const data = await r.json();
+    if (!r.ok) throw new Error(formatErr(data));
+    renderInspection(data);
+    toast(`巡检完成：${data.summary.anomalies} 条异常 / ${data.summary.items} 条明细`,
+          data.summary.anomalies === 0);
+  } catch (e) {
+    toast("巡检失败：" + e.message, false);
+    $("inspect-meta").textContent = "巡检失败，请重试";
+  } finally {
+    btn.classList.remove("spin"); btn.textContent = "开始巡检";
+  }
+}
+function renderInspection(data) {
+  const s = data.summary;
+  $("inspect-meta").textContent =
+    `巡检号 ${data.inspection_id} ｜ 快照时间 ${data.snapshot_at} ｜ ` +
+    `已生效包 ${data.packages_checked} 个 ｜ 快照内运单 ${data.snapshot_counts.waybills} 张 / ` +
+    `货批 ${data.snapshot_counts.batches} 条`;
+  const kpis = [
+    ["明细条数", s.items, false],
+    ["异常条数", s.anomalies, s.anomalies > 0],
+    ...Object.entries(s.by_code).map(([k, v]) => [codeLabels[k] || k, v, v > 0]),
+  ];
+  $("inspect-summary").innerHTML = kpis.map(([label, val, bad]) =>
+    `<div class="kpi${bad ? " bad" : ""}">${esc(label)}<b>${val}</b></div>`).join("");
+  const rows = data.items.map(it => {
+    const bad = it.status === "anomaly";
+    const before = it.before_weight_kg === null ? "—" : it.before_weight_kg;
+    const after = it.after_weight_kg === null ? "—" : it.after_weight_kg;
+    return `<tr>
+      <td><code>${esc(it.package_no)}</code>${it.scope === "ledger"
+          ? '<div class="muted">台账终态</div>' : ""}</td>
+      <td><code>${esc(it.batch_no)}</code>${it.origin_waybills.length
+          ? `<div class="muted">原单 ${it.origin_waybills.map(esc).join(", ")}</div>` : ""}</td>
+      <td>${before}</td>
+      <td>${after}</td>
+      <td class="batches">${it.old_waybills.map(esc).join(", ") || "—"}
+        <div>→ ${it.new_waybills.map(esc).join(", ") || "—"}</div></td>
+      <td><span class="badge ${bad ? "b-anomaly" : "b-ok"}">${bad ? "异常" : "正常"}</span>
+        ${it.codes.map(c => `<div><span class="code">${esc(codeLabels[c] || c)}</span></div>`).join("")}</td>
+      <td>${it.reason ? `<span class="reason">${esc(it.reason)}</span>` : '<span class="muted">—</span>'}</td>
+    </tr>`;
+  }).join("");
+  $("insp-tbody").innerHTML = rows ||
+    '<tr><td colspan="7" class="muted">没有已生效改单包可巡检</td></tr>';
+}
 
 // ---------- 初始化 ----------
 addBatchRow("wb-batches");

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import services
+from . import inspection, services
 from .database import init_db
 from .schemas import PackageIn, WaybillIn
 from .services import DomainError
@@ -82,6 +82,19 @@ def list_packages(
     ),
 ) -> list[dict]:
     return services.list_packages(status)
+
+
+# --------------------------------------------------------------------------- #
+# 改单台账质量巡检
+# --------------------------------------------------------------------------- #
+@app.get("/api/inspections/quality", tags=["inspection"])
+def quality_inspection() -> dict:
+    """固定同一 SQLite 读快照，巡检已生效改单包并逐条给出异常。
+
+    巡检使用独立只读连接；报告生成期间仍可提交原单/改单包，新写入不会混入
+    本次报告。
+    """
+    return inspection.run_inspection()
 
 
 # --------------------------------------------------------------------------- #

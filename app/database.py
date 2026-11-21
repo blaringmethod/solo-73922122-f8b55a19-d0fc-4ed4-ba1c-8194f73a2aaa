@@ -85,6 +85,35 @@ def read_connection(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
 
 
 @contextmanager
+def snapshot_connection(
+    db_path: str | None = None,
+) -> Iterator[sqlite3.Connection]:
+    """固定一个 SQLite 读快照。
+
+    WAL 模式下，读事务在第一次读取数据库时确定快照，之后同一事务内的所有
+    查询都看到同一版本的数据；其他连接仍可继续提交写事务（不会被本次读
+    阻塞），因此巡检期间可以正常提交改单，而本次报告不会混入新写入。
+
+    ``PRAGMA query_only`` 保证巡检连接绝不会写库。退出时回滚只读事务。
+    """
+    conn = _connect(db_path)
+    try:
+        # 关闭 sqlite3 模块的隐式事务管理，显式开启只读事务。
+        conn.isolation_level = None
+        conn.execute("PRAGMA query_only = ON")
+        # 读快照期间只持有共享锁，不阻塞其他连接的 WAL 写入。
+        conn.execute("BEGIN")
+        # 第一次 SELECT 才真正读取数据库并固定快照。
+        conn.execute("SELECT COUNT(*) FROM waybills").fetchone()
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
+
+
+@contextmanager
 def write_transaction(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
     """串行化的写事务：先拿进程锁，再以 IMMEDIATE 立即获取写锁。"""
     with _write_lock:
